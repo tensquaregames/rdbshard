@@ -124,7 +124,7 @@ static inline void shardfn_free(shardfn_t sfn) {
 static hash_t fnv1a_64(const void *key, size_t keylen)
 {
     const uint8_t *p = key, *q = p + keylen;
-    
+
     hash_t ret = 0x84222325;
     while(p < q)
         ret = (ret ^ *p++) * 0x1b3;
@@ -302,7 +302,7 @@ static ssize_t reader_ahead(struct reader *rd, size_t n)
             rd->rdptr -= slide;
             rd->wrptr -= slide;
         }
-        
+
         if(rd->rdptr + n > rd->end)
         {
             size_t current = rd->end - rd->buf,
@@ -399,10 +399,10 @@ static int writer_flush(struct writer *wr)
 {
     if(wr->ptr == wr->buf)
         return 0;
-   
+
     if(-1 == writer_loop(wr->fd, wr->buf, wr->ptr))
         return -1;
-    
+
     wr->ptr = wr->buf;
     return 0;
 }
@@ -479,6 +479,8 @@ enum {
     REDIS_RDB_32BITLEN = 2,
     REDIS_RDB_ENCVAL = 3,
 
+    REDIS_RDB_OPCODE_AUX = 250,
+    REDIS_RDB_OPCODE_RESIZEDB = 251,
     REDIS_RDB_OPCODE_EXPIRETIME_MS = 252,
     REDIS_RDB_OPCODE_EXPIRETIME = 253,
     REDIS_RDB_OPCODE_SELECTDB = 254,
@@ -489,11 +491,13 @@ enum {
     REDIS_RDB_TYPE_SET = 2,
     REDIS_RDB_TYPE_ZSET = 3,
     REDIS_RDB_TYPE_HASH = 4,
+    REDIS_RDB_TYPE_ZSET_2 = 5,
     REDIS_RDB_TYPE_HASH_ZIPMAP = 9,
     REDIS_RDB_TYPE_LIST_ZIPLIST = 10,
     REDIS_RDB_TYPE_SET_INTSET = 11,
     REDIS_RDB_TYPE_ZSET_ZIPLIST = 12,
     REDIS_RDB_TYPE_HASH_ZIPLIST = 13,
+    REDIS_RDB_TYPE_LIST_QUICKLIST = 14,
 
     REDIS_RDB_ENC_INT8 = 0,
     REDIS_RDB_ENC_INT16 = 1,
@@ -527,11 +531,14 @@ static int funnyint_parse(const void *b, int len, uint32_t *out, int *special)
             *special = 0;
             return 2;
         case REDIS_RDB_32BITLEN:
-            if(len < 5) return -1;
-            memcpy(&x, buf+1, 4);
-            *out = be32toh(x);
-            *special = 0;
-            return 5;
+            if(buf[0] == 0x80) {
+                if(len < 5) return -1;
+                memcpy(&x, buf+1, 4);
+                *out = be32toh(x);
+                *special = 0;
+                return 5;
+            }
+            break;
         case REDIS_RDB_ENCVAL:
             *out = buf[0] & 0x3f;
             *special = 1;
@@ -635,7 +642,7 @@ static void rdb_check_crc(struct reader *rd, rdb_ver_t ver)
         reader_advance(rd, 8);
         rc -= 8;
         if(0 != rd->crc64) {
-            errmsg("%s: rdb tail corrupted (invalid checksum; residuum: %016llX)", rd->name, rd->crc64);
+            errmsg("%s: rdb tail corrupted (invalid checksum; residuum: %016lX)", rd->name, rd->crc64);
             return;
         }
     }
@@ -651,44 +658,6 @@ static void rdb_write_crc(struct writer *wr)
     if(-1 == writer_write(wr, &crc, 8))
         failerr("writer_write");
 }
-
-static int rdb_read_dbsel(struct reader *rd)
-{
-    rdb_need(rd, 1, "truncated file (expected db selector or eof)");
-    uint8_t opcode = (uint8_t)rd->rdptr[0];
-    reader_advance(rd, 1);
-
-    if(REDIS_RDB_OPCODE_EOF == opcode)
-        return -1;
-
-    if(REDIS_RDB_OPCODE_SELECTDB == opcode) {
-        uint32_t dbnum;
-        int special;
-        if(-1 == funnyint_read(rd, &dbnum, &special))
-            failerr("%s: malformed db index", rd->name);
-        if(special)
-            failure("%s: db index is a special funnyint", rd->name);
-        return dbnum;
-    }
-
-    failure("%s: malformed file (expected db selector or eof)", rd->name);
-}
-static void rdb_write_dbsel(struct writer *wr, int dbnum)
-{
-    char buf[1];
-    if(-1 != dbnum)
-        buf[0] = REDIS_RDB_OPCODE_SELECTDB;
-    else
-        buf[0] = REDIS_RDB_OPCODE_EOF;
-
-    if(-1 == writer_write(wr, buf, 1))
-        failerr("writer_write");
-
-    if(-1 != dbnum) 
-        if(-1 == funnyint_write(wr, dbnum))
-            failerr("funnyint_write");
-}
-
 
 struct rdb_string_fmt {
     int (*xfer)(void *out, const void *in, const struct rdb_string_fmt *fmt);
@@ -784,10 +753,60 @@ static int rdb_read_string(struct reader *rd, char **bufp, size_t *buflenp)
     return fmt.decbytes;
 }
 
+static int rdb_read_dbsel(struct reader *rd)
+{
+    while(1) {
+        rdb_need(rd, 1, "truncated file (expected db selector or eof)");
+        uint8_t opcode = (uint8_t)rd->rdptr[0];
+        reader_advance(rd, 1);
+
+        if(REDIS_RDB_OPCODE_EOF == opcode)
+            return -1;
+
+        if(REDIS_RDB_OPCODE_AUX == opcode) {
+            struct rdb_string_fmt fmt;
+
+            rdb_read_string_header(rd, &fmt);
+            reader_advance(rd, fmt.encbytes);
+
+            rdb_read_string_header(rd, &fmt);
+            reader_advance(rd, fmt.encbytes);
+            continue;
+        }
+
+        if(REDIS_RDB_OPCODE_SELECTDB == opcode) {
+            uint32_t dbnum;
+            int special;
+            if(-1 == funnyint_read(rd, &dbnum, &special))
+                failerr("%s: malformed db index", rd->name);
+            if(special)
+                failure("%s: db index is a special funnyint", rd->name);
+            return dbnum;
+        }
+
+        failure("%s: malformed file (expected db selector or eof, got: %d)", rd->name, opcode);
+    }
+}
+static void rdb_write_dbsel(struct writer *wr, int dbnum)
+{
+    char buf[1];
+    if(-1 != dbnum)
+        buf[0] = REDIS_RDB_OPCODE_SELECTDB;
+    else
+        buf[0] = REDIS_RDB_OPCODE_EOF;
+
+    if(-1 == writer_write(wr, buf, 1))
+        failerr("writer_write");
+
+    if(-1 != dbnum)
+        if(-1 == funnyint_write(wr, dbnum))
+            failerr("funnyint_write");
+}
+
 /* ------------------------------------------------------------------------- */
 
 /* forward decls of some utilities not directly related to sharding process */
-static void fmt_filesize(char *buf, off_t size); 
+static void fmt_filesize(char *buf, off_t size);
 
 static inline int is_quiet();
 
@@ -820,7 +839,7 @@ static void shard_progress_update(struct shard_ctx *ctx)
     for(int i=0; i<ctx->rd_count; i++)
         processed_size += ctx->rd[i].processed_size;
     off_t remaining_size = ctx->total_size - processed_size;
-    
+
     float percent = 100.f * (float)processed_size / (float)ctx->total_size;
 
     time_t now = time(NULL);
@@ -856,7 +875,7 @@ static int shard_read_opcode(struct reader *rd)
         if(REDIS_RDB_OPCODE_SELECTDB == opcode ||
            REDIS_RDB_OPCODE_EOF == opcode)
             return opcode;
-        
+
         reader_advance(rd, 1);
 
         if(REDIS_RDB_OPCODE_EXPIRETIME_MS == opcode)
@@ -881,6 +900,21 @@ static int shard_read_opcode(struct reader *rd)
             continue;
         }
 
+        if(REDIS_RDB_OPCODE_RESIZEDB == opcode) {
+            uint32_t val;
+            int special;
+
+            if(-1 == funnyint_read(rd, &val, &special))
+                failerr("funnyint_read");
+            if(special)
+                failure("%s: malformed rdb file (db size is a special funnyint)", rd->name);
+            if(-1 == funnyint_read(rd, &val, &special))
+                failerr("funnyint_read");
+            if(special)
+                failure("%s: malformed rdb file (expires size is a special funnyint)", rd->name);
+            continue;
+        }
+
         return opcode;
     }
 }
@@ -890,7 +924,7 @@ static void shard_xfer(struct reader *rd, struct writer *wr, int opcode)
     uint32_t stringcnt, mult = 1;
     int special;
 
-    switch(opcode) 
+    switch(opcode)
     {
         case REDIS_RDB_TYPE_STRING:
         case REDIS_RDB_TYPE_HASH_ZIPMAP:
@@ -904,8 +938,11 @@ static void shard_xfer(struct reader *rd, struct writer *wr, int opcode)
         case REDIS_RDB_TYPE_ZSET:
         case REDIS_RDB_TYPE_HASH:
             mult = 2;
+            __attribute__ ((fallthrough));
         case REDIS_RDB_TYPE_LIST:
         case REDIS_RDB_TYPE_SET:
+        case REDIS_RDB_TYPE_LIST_QUICKLIST:
+        case REDIS_RDB_TYPE_ZSET_2:
             reader_pin(rd);
             if(-1 == funnyint_read(rd, &stringcnt, &special))
                 failerr("funnyint_read");
@@ -934,6 +971,14 @@ static void shard_xfer(struct reader *rd, struct writer *wr, int opcode)
             failerr("xfer_bytes");
         if((size_t)rc != fmt.encbytes)
             failure("%s: truncated rdb file (object data)", rd->name);
+
+        if(opcode == REDIS_RDB_TYPE_ZSET_2) {
+            rc = xfer_bytes(rd, wr, 8);
+            if(-1 == rc)
+                failerr("xfer_bytes");
+            if((size_t)rc != 8)
+                failure("%s: truncated rdb file (object data)", rd->name);
+        }
     }
 }
 
@@ -979,13 +1024,13 @@ static void shard(struct shard_ctx *ctx)
 {
     rdb_ver_t ver[ctx->rd_count],
               maxver = 0;
-    
+
     ctx->total_size = 0;
 
     for(int i=0; i<ctx->rd_count; i++)
     {
         ver[i] = rdb_check_header(&ctx->rd[i]);
-        if(ver[i] > 6)
+        if(ver[i] > 9)
             failure("%s: rdb file version %d is not supported", ctx->rd[i].name, ver[i]);
         if(ver[i] > maxver)
             maxver = ver[i];
@@ -1000,8 +1045,8 @@ static void shard(struct shard_ctx *ctx)
                 ctx->rd_count, totalsize, ctx->wr_count,
                 hashfn_name(ctx->hfn), shardfn_name(ctx->sfn),
                 maxver);
-       
-        ctx->start_time = time(NULL); 
+
+        ctx->start_time = time(NULL);
 
         start_progress_timer();
         shard_progress_update(ctx);
@@ -1032,14 +1077,14 @@ static void shard(struct shard_ctx *ctx)
 
         for(int i=0; i<ctx->wr_count; i++)
             rdb_write_dbsel(&ctx->wr[i], min_db);
-        
+
         for(int i=0; i<ctx->rd_count; i++)
             if(db_ahead[i] == min_db) {
                 shard_one(ctx, &ctx->rd[i]);
                 db_ahead[i] = rdb_read_dbsel(&ctx->rd[i]);
             }
     }
-    
+
     free(ctx->keybuf);
 
     for(int i=0; i<ctx->rd_count; i++)
@@ -1077,7 +1122,7 @@ static void fmt_filesize(char *buf, off_t size)
         sprintf(buf, "%.2lf MB", (double)size / 1048576.);
     else if(size < 1073741824)
         sprintf(buf, "%.1lf MB", (double)size / 1048576.);
-    else 
+    else
         sprintf(buf, "%.2lf GB", (double)size / 1073741824.);
 }
 
@@ -1148,7 +1193,7 @@ static void print_usage()
         fprintf(stderr, " %s%s",
                 default_hashfn == all_hashfns[i] ? "*" : "",
                 all_hashfns[i]->name);
-    
+
     fputs("\navailable sharders [-s] (* is default): ", stderr);
     for(int i=0; all_shardfns[i]; i++)
         fprintf(stderr, " %s%s",
@@ -1263,7 +1308,7 @@ int main(int argc, char *argv[])
         char buf[namelen + 8];
         strcpy(buf, node_names[i]);
         strcpy(buf + namelen, ".rdb");
-        
+
         int fd = open(buf, O_WRONLY|O_EXCL|O_CREAT|O_CLOEXEC, 0666);
         if(-1 == fd)
             failerr("failed to create output file %s: open", buf);
@@ -1275,7 +1320,7 @@ int main(int argc, char *argv[])
 
     for(int i=0; i<n_nodes; i++)
         writer_free(&wr[i]);
-    
+
     for(int i=0; i<n_inputs; i++) {
         reader_free(&rd[i]);
         close(rd[i].fd);
@@ -1288,4 +1333,3 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-
